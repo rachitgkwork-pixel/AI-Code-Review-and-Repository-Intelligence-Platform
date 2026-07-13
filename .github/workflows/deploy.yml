@@ -1,0 +1,89 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_BACKEND_REPO: ai-code-review-backend
+  ECR_FRONTEND_REPO: ai-code-review-frontend
+  ECS_CLUSTER: ai-code-review-cluster
+  ECS_SERVICE: ai-code-review-service
+  ECS_TASK_FAMILY: ai-code-review
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f docker/Dockerfile.backend \
+            -t $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_BACKEND_REPO:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPO:latest
+
+      - name: Build & push frontend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f docker/Dockerfile.frontend \
+            -t $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_FRONTEND_REPO:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPO:latest
+
+      - name: Update ECS task definition with new image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition $ECS_TASK_FAMILY --query taskDefinition)
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq \
+            --arg backend_img "$ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG" \
+            --arg frontend_img "$ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG" \
+            '.containerDefinitions |= map(
+              if .name == "backend" then .image = $backend_img
+              elif .name == "frontend" then .image = $frontend_img
+              else . end
+            ) | {family: .family, networkMode: .networkMode,
+                 requiresCompatibilities: .requiresCompatibilities,
+                 cpu: .cpu, memory: .memory,
+                 executionRoleArn: .executionRoleArn,
+                 taskRoleArn: .taskRoleArn,
+                 containerDefinitions: .containerDefinitions}')
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $NEW_REVISION \
+            --force-new-deployment
+          echo "Deployed task definition: $NEW_REVISION"
